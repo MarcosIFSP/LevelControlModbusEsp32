@@ -1,7 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <ModbusMaster.h>
-#include <ModbusRTU.h>
 
 // Configuração do display OLED
 #define SCREEN_WIDTH 128
@@ -12,36 +11,34 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// Configuração Modbus Master (Radar)
+// Configuração Modbus
 #define RS485_RXD 16
 #define RS485_TXD 17
 #define RS485_DE_RE 4
 ModbusMaster master;
 
-// Configuração Modbus Slave
-#define RS485_SLAVE_RXD 26
-#define RS485_SLAVE_TXD 27
-#define RS485_SLAVE_DE_RE 15
-ModbusRTU slave;
-
 // Configuração do relé
 #define RELE_PIN 25
 bool releAtivado = false;
 
-// Variáveis Modbus Master
+// Configuração do registrador
 const uint8_t radarID = 246;
-const uint16_t enderecoNivel = 0x089A;
+const uint16_t enderecoNivel = 1302; // Endereço inicial do Input Register
 float nivelProcesso = 0.0;
 
-// Registradores Modbus Slave
-uint16_t regNivel = 0; // Valor do nível armazenado no registrador do slave
-
-void preTransmissionMaster() {
-  digitalWrite(RS485_DE_RE, HIGH); // Habilita transmissão
+// Funções de controle do RS485
+void preTransmission() {
+  digitalWrite(RS485_DE_RE, HIGH);
 }
 
-void postTransmissionMaster() {
-  digitalWrite(RS485_DE_RE, LOW); // Habilita recepção
+void postTransmission() {
+  digitalWrite(RS485_DE_RE, LOW);
+}
+
+// Combina dois registradores Modbus em um Float32
+float combineRegisters(uint16_t highWord, uint16_t lowWord) {
+  uint32_t combined = ((uint32_t)highWord << 16) | lowWord;
+  return *(float*)&combined;
 }
 
 void setup() {
@@ -63,39 +60,47 @@ void setup() {
 
   // Configuração do relé
   pinMode(RELE_PIN, OUTPUT);
-  digitalWrite(RELE_PIN, LOW);
+  digitalWrite(RELE_PIN, LOW); // Relé desligado inicialmente
 
-  // Configuração do Master Modbus
+  // Configuração do Modbus Master
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
   Serial2.begin(9600, SERIAL_8N1, RS485_RXD, RS485_TXD);
   master.begin(radarID, Serial2);
-  master.preTransmission(preTransmissionMaster);
-  master.postTransmission(postTransmissionMaster);
-
-  // Configuração do Slave Modbus
-  pinMode(RS485_SLAVE_DE_RE, OUTPUT);
-  digitalWrite(RS485_SLAVE_DE_RE, LOW);
-  Serial1.begin(9600, SERIAL_8N1, RS485_SLAVE_RXD, RS485_SLAVE_TXD);
-  slave.begin(&Serial1, RS485_SLAVE_DE_RE);
-  slave.slave(1); // ID do Slave: 1
-  slave.addHreg(1, regNivel); // Registrador 1 contém o nível
+  master.preTransmission(preTransmission);
+  master.postTransmission(postTransmission);
 
   Serial.println("Setup concluído!");
 }
 
 void loop() {
   uint8_t result;
-  uint16_t data;
+  uint16_t dataHigh, dataLow;
 
-  // Leitura do Radar (Master)
-  result = master.readHoldingRegisters(enderecoNivel, 1);
+  // Ler dois registradores consecutivos (1302 e 1303)
+  Serial.println("Lendo Input Registers 1302 e 1303...");
+  result = master.readInputRegisters(enderecoNivel, 2);
+
   if (result == master.ku8MBSuccess) {
-    data = master.getResponseBuffer(0);
-    nivelProcesso = data / 1.0;
-    regNivel = (uint16_t)nivelProcesso; // Atualiza o registrador do Slave
+    dataHigh = master.getResponseBuffer(0);
+    dataLow = master.getResponseBuffer(1);
+    nivelProcesso = combineRegisters(dataHigh, dataLow);
 
-    // Atualiza display
+    Serial.print("Nivel lido: ");
+    Serial.println(nivelProcesso);
+
+    // Controle do relé
+    if (nivelProcesso >= 30.0 && !releAtivado) {
+      digitalWrite(RELE_PIN, HIGH); // Liga o relé
+      releAtivado = true;
+      Serial.println("Relé ativado!");
+    } else if (nivelProcesso <= 14.0 && releAtivado) {
+      digitalWrite(RELE_PIN, LOW); // Desliga o relé
+      releAtivado = false;
+      Serial.println("Relé desativado!");
+    }
+
+    // Atualizar display
     display.clearDisplay();
     display.setCursor(0, 0);
     display.setTextSize(1);
@@ -104,24 +109,31 @@ void loop() {
     display.setTextSize(2);
     display.printf("%.2f %%", nivelProcesso);
     display.display();
-
-    // Controle do relé
-    if (nivelProcesso >= 30.0 && !releAtivado) {
-      digitalWrite(RELE_PIN, HIGH);
-      releAtivado = true;
-      Serial.println("Relé ativado!");
-    } else if (nivelProcesso <= 14.0 && releAtivado) {
-      digitalWrite(RELE_PIN, LOW);
-      releAtivado = false;
-      Serial.println("Relé desativado!");
-    }
   } else {
-    Serial.print("Erro ao ler registrador. Código: ");
+    // Exibir erro no Serial
+    Serial.print("Erro ao ler registradores. Código: ");
     Serial.println(result);
+    if (result == 2) {
+      Serial.println("Endereço de registrador inválido (ILLEGAL DATA ADDRESS).");
+    } else if (result == 226) {
+      Serial.println("Timeout na comunicação Modbus.");
+    } else if (result == 227) {
+      Serial.println("Erro de resposta do escravo.");
+    } else {
+      Serial.println("Erro desconhecido.");
+    }
+
+    // Atualizar display com erro
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.println("NIVEL");
+    display.setCursor(0, 16);
+    display.setTextSize(1);
+    display.println("Erro ao ler radar!");
+    display.display();
   }
 
-  // Processa o Slave
-  slave.task();
-
-  delay(1000); // Intervalo entre requisições
+  delay(1000);
 }
+
